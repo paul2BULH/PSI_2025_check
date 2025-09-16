@@ -182,4 +182,4 @@ if uploaded:
 
     st.success("Evaluation complete.")
 else:
-    st.info("Please upload a compatible Excel to begin.")    
+    st.info("Please upload a compatible Excel to begin.")
