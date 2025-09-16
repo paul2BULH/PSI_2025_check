@@ -98,7 +98,39 @@ class PSIEvalResult:
     debug: Dict[str, Any] = field(default_factory=dict)
     debug_path: Optional[str] = None
 
+    def __post_init__(self):
+        placeholder_vals = {"", "awaiting rule text", "awaiting rule", "awaiting rationale", "todo"}
+        val = (self.rationale_short or "").strip().lower()
+        if val in placeholder_vals:
+            base = (str(self.result or "")).strip().upper() or "RESULT"
+            denom = "denominator met" if bool(self.denominator_met) else "denominator not met"
+            numer = "numerator met" if bool(self.numerator_met) else "numerator not met"
+            extras = []
+            if self.exclusions_applied:
+                extras.append("exclusions: " + ", ".join(self.exclusions_applied))
+            summary = ", ".join([denom, numer] + extras)
+            self.rationale_short = f"{base} — {summary}"
+        try:
+            self.rationale_short = _format_auto_rationale(
+                self.psi, self.result, self.denominator_met, self.numerator_met,
+                self.exclusions_applied, self.debug
+            )
+        except Exception:
+            pass
 
+    def to_row(self) -> Dict[str, Any]:
+        return {
+            "EncounterID": self.encounter_id,
+            "PSI": self.psi,
+            "Result": (self.result or "").upper() if isinstance(self.result, str) else str(self.result),
+            "Rationale_Short": self.rationale_short or "",
+            "Denominator_Met": bool(self.denominator_met),
+            "Numerator_Met": bool(self.numerator_met),
+            "Exclusions_Applied": "; ".join(self.exclusions_applied) if self.exclusions_applied else "",
+            "Checklist_Pass_Count": sum(1 for c in (self.checklist or []) if getattr(c, "passed", False)),
+            "Checklist_Total": len(self.checklist or []),
+            "Debug_File": self.debug_path or "",
+        }
 
 # -------------------------
 # Registry for PSI functions
