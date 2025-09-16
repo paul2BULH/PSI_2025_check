@@ -11,7 +11,7 @@ import psi_core as psi
 
 st.set_page_config(page_title="PSI 03–19 Evaluator (2025)", layout="wide")
 
-st.title("PSI 03–19 Evaluator (2025)")
+st.title("PSI 03–19 Evaluator (2025) — Bulwark/ARC+")
 st.caption("Upload your compatible Excel. App uses your PSI core to compute results and show checklist per encounter.")
 
 # Sidebar controls
@@ -182,4 +182,4 @@ if uploaded:
 
     st.success("Evaluation complete.")
 else:
-    st.info("Please upload a compatible Excel to begin.")
+    st.info("Please upload a compatible Excel to begin.")    
