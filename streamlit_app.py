@@ -7,7 +7,7 @@ import numpy as np
 import streamlit as st
 
 # Import user's evaluation engine
-import psi_core as psi
+import psi_calculator_2025_03_19_patched as psi
 
 st.set_page_config(page_title="PSI 03–19 Evaluator (2025)", layout="wide")
 
