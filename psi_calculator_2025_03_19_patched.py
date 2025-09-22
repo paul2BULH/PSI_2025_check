@@ -1,4 +1,3 @@
-
 import argparse
 import json
 import os
@@ -98,37 +97,17 @@ class PSIEvalResult:
     debug: Dict[str, Any] = field(default_factory=dict)
     debug_path: Optional[str] = None
 
-    def __post_init__(self):
-        placeholder_vals = {"", "awaiting rule text", "awaiting rule", "awaiting rationale", "todo"}
-        val = (self.rationale_short or "").strip().lower()
-        if val in placeholder_vals:
-            base = (str(self.result or "")).strip().upper() or "RESULT"
-            denom = "denominator met" if bool(self.denominator_met) else "denominator not met"
-            numer = "numerator met" if bool(self.numerator_met) else "numerator not met"
-            extras = []
-            if self.exclusions_applied:
-                extras.append("exclusions: " + ", ".join(self.exclusions_applied))
-            summary = ", ".join([denom, numer] + extras)
-            self.rationale_short = f"{base} — {summary}"
-        try:
-            self.rationale_short = _format_auto_rationale(
-                self.psi, self.result, self.denominator_met, self.numerator_met,
-                self.exclusions_applied, self.debug
-            )
-        except Exception:
-            pass
-
     def to_row(self) -> Dict[str, Any]:
         return {
             "EncounterID": self.encounter_id,
             "PSI": self.psi,
-            "Result": (self.result or "").upper() if isinstance(self.result, str) else str(self.result),
-            "Rationale_Short": self.rationale_short or "",
-            "Denominator_Met": bool(self.denominator_met),
-            "Numerator_Met": bool(self.numerator_met),
+            "Result": self.result,
+            "Rationale_Short": self.rationale_short,
+            "Denominator_Met": self.denominator_met,
+            "Numerator_Met": self.numerator_met,
             "Exclusions_Applied": "; ".join(self.exclusions_applied) if self.exclusions_applied else "",
-            "Checklist_Pass_Count": sum(1 for c in (self.checklist or []) if getattr(c, "passed", False)),
-            "Checklist_Total": len(self.checklist or []),
+            "Checklist_Pass_Count": sum(1 for c in self.checklist if c.passed),
+            "Checklist_Total": len(self.checklist),
             "Debug_File": self.debug_path or "",
         }
 
@@ -835,68 +814,67 @@ def evaluate_psi04(row: pd.Series, codes: Dict[str, List[str]]) -> PSIEvalResult
 @register_psi(5)
 def evaluate_psi05(row: pd.Series, codes: Dict[str, List[str]]) -> PSIEvalResult:
     """
-    PSI-05 Retained Surgical Item or Unretrieved Device Fragment (2025).
-    Count indicator; here we classify encounters as INCLUSION when numerator criteria met and no exclusions.
-    Spec source: 2025 PSI-05 markdown uploaded by user.
+    PSI-05 Retained Surgical Item or Unretrieved Device Fragment Count (2025).
     """
     enc_id = str(row.get("EncounterID", ""))
     checklist: List[ChecklistItem] = []
     exclusions: List[str] = []
-    debug: Dict[str, Any] = {}
 
     # Core fields
     age = row.get("Age", None)
     drg3 = row.get("MS-DRG_3digit", "")
     principal_dx = str(row.get("Pdx", "")).strip().upper()
 
-    # Parse dx/poa
-    dx_list = extract_dx_poa(row)  # [(code, poa, role)]
-    secondary_dx = [(c,p) for (c,p,role) in dx_list if role == "SECONDARY"]
-
-    # Sets
+    # DRG sets
     SURGI2R = set(str(x).zfill(3) for x in codes.get("SURGI2R", []))
     MEDIC2R = set(str(x).zfill(3) for x in codes.get("MEDIC2R", []))
+
+    # Other sets
     MDC14PRINDX = set(codes.get("MDC14PRINDX", []))
     MDC15PRINDX = set(codes.get("MDC15PRINDX", []))
     FOREIID = set(codes.get("FOREIID", []))
 
-    # Denominator / cohort: Surgical or medical discharge AND (Age>=18 OR obstetric principal)
+    # Extract dx+poa
+    dx_list = extract_dx_poa(row)  # [(code, poa, role)]
+
+    # --- Denominator check
+    drg_ok = drg3 in SURGI2R or drg3 in MEDIC2R
     age_ok = False
     if age is not None and str(age).strip() != "":
         try:
-            age_ok = float(age) >= 18
+            av = float(age)
+            age_ok = av >= 18
         except Exception:
             age_ok = False
-    obstetric_principal = (principal_dx in MDC14PRINDX)
-    drg_ok = (drg3 in SURGI2R) or (drg3 in MEDIC2R)
+    obstetric_principal = principal_dx in MDC14PRINDX
 
     checklist.append(ChecklistItem("DRG in SURGI2R or MEDIC2R", "Yes", drg3, drg_ok))
-    checklist.append(ChecklistItem("Age >= 18 OR obstetric principal (MDC14PRINDX)", "Yes", f"Age={age}, MDC14_Principal={obstetric_principal}", age_ok or obstetric_principal))
+    checklist.append(ChecklistItem("Age >=18 or obstetric principal", "Yes", f"Age={age}, obstetric={obstetric_principal}", age_ok or obstetric_principal))
 
     denominator_met = drg_ok and (age_ok or obstetric_principal)
 
-    # Exclusions (precedence)
+    # --- Exclusions
     # Principal in FOREIID
-    prin_is_foreiid = (principal_dx in FOREIID)
-    checklist.append(ChecklistItem("Principal DX is retained item/device fragment (FOREIID)", "No", principal_dx, not prin_is_foreiid))
-    if prin_is_foreiid: exclusions.append("Principal in FOREIID")
+    excl_pdx_forei = principal_dx in FOREIID
+    checklist.append(ChecklistItem("Principal not in FOREIID", "No", "Yes" if excl_pdx_forei else "No", not excl_pdx_forei))
+    if excl_pdx_forei: exclusions.append("PrincipalDX FOREIID")
 
     # Secondary FOREIID with POA=Y
-    sec_foreiid_poaY = any((c in FOREIID) and (p == "Y") for (c,p) in secondary_dx)
-    checklist.append(ChecklistItem("Secondary FOREIID present-on-admission", "No", "Yes" if sec_foreiid_poaY else "No", not sec_foreiid_poaY))
-    if sec_foreiid_poaY: exclusions.append("Secondary FOREIID POA=Y")
+    excl_sec_poaY = any(code in FOREIID and poa == "Y" for (code, poa, role) in dx_list if role == "SECONDARY")
+    checklist.append(ChecklistItem("No secondary FOREIID with POA=Y", "No", "Yes" if excl_sec_poaY else "No", not excl_sec_poaY))
+    if excl_sec_poaY: exclusions.append("Secondary FOREIID POA=Y")
 
-    # Newborn principal MDC15
-    mdc15 = (principal_dx in MDC15PRINDX)
-    checklist.append(ChecklistItem("MDC15 principal (newborn) excluded", "No", "Yes" if mdc15 else "No", not mdc15))
-    if mdc15: exclusions.append("MDC15PRINDX")
+    # MDC15
+    excl_mdc15 = principal_dx in MDC15PRINDX
+    checklist.append(ChecklistItem("Principal not MDC15 (newborn)", "No", "Yes" if excl_mdc15 else "No", not excl_mdc15))
+    if excl_mdc15: exclusions.append("MDC15PRINDX")
 
-    # DRG 999
-    drg999 = (drg3 == "999")
-    checklist.append(ChecklistItem("DRG not 999 (ungroupable)", "Not 999", drg3, not drg999))
-    if drg999: exclusions.append("DRG=999")
+    # DRG=999
+    excl_drg999 = (drg3 == "999")
+    checklist.append(ChecklistItem("DRG not 999", "Not 999", drg3, not excl_drg999))
+    if excl_drg999: exclusions.append("DRG=999")
 
-    # Missing fields
+    # Missing required fields
     def missing(col: str) -> bool:
         return (col not in row) or (pd.isna(row[col])) or (str(row[col]).strip() == "")
     miss_sex = missing("Sex")
@@ -917,41 +895,27 @@ def evaluate_psi05(row: pd.Series, codes: Dict[str, List[str]]) -> PSIEvalResult
     if miss_year: exclusions.append("Missing Year")
     if miss_pdx: exclusions.append("Missing Pdx")
 
-    # Missing MDC if provided
     if "MDC" in row:
         miss_mdc = missing("MDC")
         checklist.append(ChecklistItem("Missing MDC (if provided)", "Present/NA", "Missing" if miss_mdc else "Present/NA", not miss_mdc))
         if miss_mdc: exclusions.append("Missing MDC")
 
+    # --- Early exits
     if not denominator_met:
-        return PSIEvalResult(
-            encounter_id=enc_id, psi="PSI_05",
-            result="EXCLUSION", denominator_met=False, numerator_met=False,
-            exclusions_applied=exclusions, rationale_short="Denominator not met",
-            checklist=checklist, debug={"drg3": drg3, "age": age}
-        )
-
+        return PSIEvalResult(enc_id, "PSI_05", "EXCLUSION", False, False, exclusions,
+            "Denominator not met", checklist, debug={"age": age, "drg3": drg3, "pdx": principal_dx})
     if exclusions:
-        return PSIEvalResult(
-            encounter_id=enc_id, psi="PSI_05",
-            result="EXCLUSION", denominator_met=True, numerator_met=False,
-            exclusions_applied=exclusions, rationale_short="Exclusion(s) applied",
-            checklist=checklist, debug={"exclusions": exclusions}
-        )
+        return PSIEvalResult(enc_id, "PSI_05", "EXCLUSION", True, False, exclusions,
+            "Exclusion(s) applied", checklist, debug={"exclusions": exclusions})
 
-    # Numerator: any secondary FOREIID with POA != Y
-    numerator_hit = any((c in FOREIID) and (p != "Y") for (c,p) in secondary_dx)
-    checklist.append(ChecklistItem("Numerator: secondary FOREIID not POA=Y", "Yes", "Yes" if numerator_hit else "No", numerator_hit))
+    # --- Numerator: secondary FOREIID not POA=Y
+    numerator_hit = any(code in FOREIID and poa != "Y" for (code, poa, role) in dx_list if role == "SECONDARY")
+    checklist.append(ChecklistItem("Secondary FOREIID not POA=Y (numerator)", "Yes", "Yes" if numerator_hit else "No", numerator_hit))
 
     result = "INCLUSION" if numerator_hit else "EXCLUSION"
-    rationale = "Retained item/device fragment coded (secondary, not POA)" if numerator_hit else "No qualifying retained item/device fragment"
+    rationale = "Triggered retained surgical item/device fragment" if numerator_hit else "No qualifying secondary FOREIID"
 
-    return PSIEvalResult(
-        encounter_id=enc_id, psi="PSI_05",
-        result=result, denominator_met=True, numerator_met=numerator_hit,
-        exclusions_applied=[], rationale_short=rationale,
-        checklist=checklist, debug={"FOREIID_detected": numerator_hit}
-    )
+    return PSIEvalResult(enc_id, "PSI_05", result, True, numerator_hit, [], rationale, checklist, debug={"numerator_hit": numerator_hit})
 
 @register_psi(6)
 def evaluate_psi06(row: pd.Series, codes: Dict[str, List[str]]) -> PSIEvalResult:
@@ -1105,142 +1069,6 @@ def evaluate_psi06(row: pd.Series, codes: Dict[str, List[str]]) -> PSIEvalResult
         exclusions_applied=[], rationale_short=rationale,
         checklist=checklist, debug={}
     )
-
-@register_psi(7)
-def evaluate_psi07(row: pd.Series, codes: Dict[str, List[str]]) -> PSIEvalResult:
-    """
-    PSI-07 Central Venous Catheter-Related Bloodstream Infection Rate (2025).
-    Denominator: SURGI2R or MEDIC2R AND (Age>=18 OR obstetric principal MDC14PRINDX).
-    Exclusions: principal/secondary POA=Y IDTMC3D, LOS<2, cancer, immunocompromised dx/proc, MDC15PRINDX, DRG=999, missing fields.
-    Numerator: secondary IDTMC3D not POA=Y.
-    """
-    enc_id = str(row.get("EncounterID", ""))
-    checklist: List[ChecklistItem] = []
-    exclusions: List[str] = []
-    debug: Dict[str, Any] = {}
-
-    # Core fields
-    age = row.get("Age", None)
-    drg3 = row.get("MS-DRG_3digit", "")
-    principal_dx = str(row.get("Pdx", "")).strip().upper()
-    los = row.get("Length_of_stay", None)
-
-    dx_list = extract_dx_poa(row)
-    secondary_dx = [(c,p) for (c,p,role) in dx_list if role=="SECONDARY"]
-    all_dx = [c for (c,_,_) in dx_list]
-    procs = extract_procedures(row)
-
-    # Sets
-    SURGI2R = set(str(x).zfill(3) for x in codes.get("SURGI2R", []))
-    MEDIC2R = set(str(x).zfill(3) for x in codes.get("MEDIC2R", []))
-    MDC14PRINDX = set(codes.get("MDC14PRINDX", []))
-    MDC15PRINDX = set(codes.get("MDC15PRINDX", []))
-    IDTMC3D = set(codes.get("IDTMC3D", []))
-    CANCEID = set(codes.get("CANCEID", []))
-    IMMUNID = set(codes.get("IMMUNID", []))
-    IMMUNIP = set(codes.get("IMMUNIP", []))
-
-    # Denominator
-    age_ok = False
-    if age is not None and str(age).strip()!="":
-        try:
-            age_ok = float(age) >= 18
-        except Exception:
-            age_ok = False
-    obstetric_principal = (principal_dx in MDC14PRINDX)
-    drg_ok = (drg3 in SURGI2R) or (drg3 in MEDIC2R)
-
-    checklist.append(ChecklistItem("DRG in SURGI2R or MEDIC2R", "Yes", drg3, drg_ok))
-    checklist.append(ChecklistItem("Age>=18 or obstetric principal", "Yes", f"Age={age},Obstetric={obstetric_principal}", age_ok or obstetric_principal))
-
-    denominator_met = drg_ok and (age_ok or obstetric_principal)
-
-    # Exclusions
-    principal_in = lambda S: principal_dx in S
-    any_dx_in = lambda S: any(c in S for c in all_dx)
-
-    # Principal or secondary POA=Y IDTMC3D
-    excl_idtmc_prin = principal_in(IDTMC3D)
-    excl_idtmc_sec_poaY = any((c in IDTMC3D) and (p=="Y") for (c,p) in secondary_dx)
-    checklist.append(ChecklistItem("Principal IDTMC3D", "No", "Yes" if excl_idtmc_prin else "No", not excl_idtmc_prin))
-    checklist.append(ChecklistItem("Secondary IDTMC3D POA=Y", "No", "Yes" if excl_idtmc_sec_poaY else "No", not excl_idtmc_sec_poaY))
-    if excl_idtmc_prin: exclusions.append("Principal IDTMC3D")
-    if excl_idtmc_sec_poaY: exclusions.append("Secondary IDTMC3D POA=Y")
-
-    # LOS <2
-    los_excl = False
-    if los is not None:
-        try:
-            los_excl = int(los) < 2
-        except Exception:
-            los_excl = False
-    checklist.append(ChecklistItem("Length of stay >=2 days", ">=2", los, not los_excl))
-    if los_excl: exclusions.append("LOS<2")
-
-    # Cancer
-    has_cancer = any_dx_in(CANCEID)
-    checklist.append(ChecklistItem("Cancer DX present (CANCEID)", "No", "Yes" if has_cancer else "No", not has_cancer))
-    if has_cancer: exclusions.append("CANCEID")
-
-    # Immunocompromised DX/PROC
-    has_immun_dx = any_dx_in(IMMUNID)
-    has_immun_proc = any(code in IMMUNIP for (code,_,_) in procs)
-    checklist.append(ChecklistItem("Immunocompromised DX present (IMMUNID)", "No", "Yes" if has_immun_dx else "No", not has_immun_dx))
-    checklist.append(ChecklistItem("Immunocompromised procedure (IMMUNIP)", "No", "Yes" if has_immun_proc else "No", not has_immun_proc))
-    if has_immun_dx: exclusions.append("IMMUNID")
-    if has_immun_proc: exclusions.append("IMMUNIP")
-
-    # Newborn
-    newborn_principal = principal_in(MDC15PRINDX)
-    checklist.append(ChecklistItem("Newborn principal (MDC15PRINDX)", "No", "Yes" if newborn_principal else "No", not newborn_principal))
-    if newborn_principal: exclusions.append("MDC15PRINDX")
-
-    # DRG 999
-    drg999 = (drg3=="999")
-    checklist.append(ChecklistItem("DRG not 999", "Not 999", drg3, not drg999))
-    if drg999: exclusions.append("DRG=999")
-
-    # Missing fields
-    def missing(col: str)->bool:
-        return (col not in row) or (pd.isna(row[col])) or (str(row[col]).strip()=="")
-    miss_sex = missing("Sex")
-    miss_age = missing("Age")
-    miss_qtr = missing("DQTR") if "DQTR" in row else False
-    miss_year = missing("Year") if "Year" in row else False
-    miss_pdx = missing("Pdx")
-
-    checklist.append(ChecklistItem("Missing Sex","Present","Missing" if miss_sex else "Present", not miss_sex))
-    checklist.append(ChecklistItem("Missing Age","Present","Missing" if miss_age else "Present", not miss_age))
-    checklist.append(ChecklistItem("Missing DQTR","Present","Missing" if miss_qtr else "Present", not miss_qtr))
-    checklist.append(ChecklistItem("Missing Year","Present","Missing" if miss_year else "Present", not miss_year))
-    checklist.append(ChecklistItem("Missing Principal DX","Present","Missing" if miss_pdx else "Present", not miss_pdx))
-
-    if miss_sex: exclusions.append("Missing Sex")
-    if miss_age: exclusions.append("Missing Age")
-    if miss_qtr: exclusions.append("Missing DQTR")
-    if miss_year: exclusions.append("Missing Year")
-    if miss_pdx: exclusions.append("Missing Pdx")
-
-    # Missing MDC if provided
-    if "MDC" in row:
-        miss_mdc = missing("MDC")
-        checklist.append(ChecklistItem("Missing MDC (if provided)", "Present/NA","Missing" if miss_mdc else "Present/NA", not miss_mdc))
-        if miss_mdc: exclusions.append("Missing MDC")
-
-    # Early exits
-    if not denominator_met:
-        return PSIEvalResult(enc_id,"PSI_07","EXCLUSION",False,False,exclusions,"Denominator not met",checklist,debug)
-    if exclusions:
-        return PSIEvalResult(enc_id,"PSI_07","EXCLUSION",True,False,exclusions,"Denominator exclusion(s) applied",checklist,debug)
-
-    # Numerator: secondary IDTMC3D not POA=Y
-    numerator_hit = any((c in IDTMC3D) and (p!="Y") for (c,p) in secondary_dx)
-    checklist.append(ChecklistItem("Numerator: secondary IDTMC3D not POA=Y","Yes","Yes" if numerator_hit else "No", numerator_hit))
-
-    result = "INCLUSION" if numerator_hit else "EXCLUSION"
-    rationale = "Central line infection coded (secondary, not POA)" if numerator_hit else "No qualifying central line infection"
-
-    return PSIEvalResult(enc_id,"PSI_07",result,True,numerator_hit,[],rationale,checklist,debug)
 
 @register_psi(7)
 def evaluate_psi07(row: pd.Series, codes: Dict[str, List[str]]) -> PSIEvalResult:
@@ -1863,7 +1691,7 @@ def evaluate_psi10(row: pd.Series, codes: Dict[str, List[str]]) -> PSIEvalResult
     if excl_urinary_obs: exclusions.append("URINARYOBSID")
 
     # 6) POA solitary kidney AND any nephrectomy (PNEPHREP)
-    has_poa_solkid = any((c in SOLKIDD) and (p == "Y") for (c,p) in secondary_dx) or (principal_dx in SOLKIDD and any(p == "Y" for (c,p) in [(principal_dx, row.get('POA1',''))]))
+    has_poa_solkid = any((c in SOLKIDD) and (p == "Y") for (c,p) in secondary_dx) or (principal_dx in SOLKIDD and row.get("POA1","") == "Y")
     has_nephrectomy = any(code in PNEPHREP for (code,_,_) in procs)
     excl_solkid_neph = has_poa_solkid and has_nephrectomy
     checklist.append(ChecklistItem("POA solitary kidney (SOLKIDD)", "No", "Yes" if has_poa_solkid else "No", not has_poa_solkid))
@@ -2202,8 +2030,8 @@ def evaluate_psi11(row: pd.Series, codes: Dict[str, List[str]]) -> PSIEvalResult
     checklist.append(ChecklistItem("Numerator path 3: PR9671P last >= 2 days after first OR", "Yes (any path)", f"{last_9671_dt} vs OR {earliest_or_dt}", numerator_met if path3 else False))
     checklist.append(ChecklistItem("Numerator path 4: PR9604P last >= 1 day after first OR", "Yes (any path)", f"{last_9604_dt} vs OR {earliest_or_dt}", numerator_met if path4 else False))
 
-    result = "INCLUSION" if numerator_met else "EXCLUSION"
-    rationale = "Postop respiratory failure criteria met" if numerator_met else "No qualifying postoperative respiratory failure"
+    result = "INCLUSION" if numerator_hit else "EXCLUSION"
+    rationale = "Postop respiratory failure criteria met" if numerator_hit else "No qualifying postoperative respiratory failure"
 
     debug.update({
         "earliest_or": str(earliest_or_dt),
@@ -2215,7 +2043,7 @@ def evaluate_psi11(row: pd.Series, codes: Dict[str, List[str]]) -> PSIEvalResult
 
     return PSIEvalResult(
         encounter_id=enc_id, psi="PSI_11",
-        result=result, denominator_met=True, numerator_met=numerator_met,
+        result=result, denominator_met=True, numerator_met=numerator_hit,
         exclusions_applied=[], rationale_short=rationale,
         checklist=checklist, debug=debug
     )
@@ -3272,111 +3100,6 @@ def evaluate_psi19(row: pd.Series, codes: Dict[str, List[str]]) -> PSIEvalResult
     PSI-19 Obstetric Trauma Rate – Vaginal Delivery Without Instrument (2025).
     Denominator: any-listed DELOCMD diagnosis AND any VAGDELP procedure.
     Exclusions:
-      - Any-listed INSTRIP procedure (instrument-assisted delivery)
-      - Principal DX in MDC15PRINDX (newborn)
-      - DRG=999
-      - Missing Sex/Age/DQTR/Year/Pdx (and MDC if provided)
-    Numerator: any-listed OBTRAID diagnosis (3rd/4th degree obstetric injury).
-    """
-    enc_id = str(row.get("EncounterID", ""))
-    checklist: List[ChecklistItem] = []
-    exclusions: List[str] = []
-    debug: Dict[str, Any] = {}
-
-    # Core fields
-    drg3 = str(row.get("MS-DRG_3digit", "")).strip()
-    principal_dx = str(row.get("Pdx", "")).strip().upper()
-
-    # Parse DX/POA and procedures
-    dx_list = extract_dx_poa(row)  # [(code, poa, role)]
-    all_dx = [c for (c,_,_) in dx_list]
-    procs = extract_procedures(row)  # [(code, dt, col)]
-
-    # Sets
-    DELOCMD = set(codes.get("DELOCMD", []))
-    VAGDELP = set(codes.get("VAGDELP", []))
-    OBTRAID = set(codes.get("OBTRAID", []))
-    INSTRIP = set(codes.get("INSTRIP", []))
-    MDC15PRINDX = set(codes.get("MDC15PRINDX", []))
-
-    # Denominator checks
-    has_del_outcome = any(c in DELOCMD for c in all_dx)
-    has_vag_del = any(code in VAGDELP for (code,_,_) in procs)
-
-    checklist.append(ChecklistItem("Delivery outcome DX (DELOCMD)", "Yes", "Yes" if has_del_outcome else "No", has_del_outcome))
-    checklist.append(ChecklistItem("Vaginal delivery procedure (VAGDELP)", "Yes", "Yes" if has_vag_del else "No", has_vag_del))
-
-    denominator_met = has_del_outcome and has_vag_del
-
-    # Exclusions
-    has_instrument = any(code in INSTRIP for (code,_,_) in procs)
-    checklist.append(ChecklistItem("Any instrument-assisted procedure (INSTRIP)", "No", "Yes" if has_instrument else "No", not has_instrument))
-    if has_instrument: exclusions.append("INSTRIP present")
-
-    obstetric_newborn_principal = (principal_dx in MDC15PRINDX)
-    checklist.append(ChecklistItem("Principal DX in MDC15PRINDX (newborn)", "No", "Yes" if obstetric_newborn_principal else "No", not obstetric_newborn_principal))
-    if obstetric_newborn_principal: exclusions.append("MDC15PRINDX principal")
-
-    drg999 = (drg3 == "999")
-    checklist.append(ChecklistItem("DRG not 999 (ungroupable)", "Not 999", drg3, not drg999))
-    if drg999: exclusions.append("DRG=999")
-
-    # Missing fields
-    def missing(col: str) -> bool:
-        return (col not in row) or (pd.isna(row[col])) or (str(row[col]).strip() == "")
-    miss_sex = missing("Sex")
-    miss_age = missing("Age")
-    miss_qtr = missing("DQTR") if "DQTR" in row else False
-    miss_year = missing("Year") if "Year" in row else False
-    miss_pdx = missing("Pdx")
-
-    checklist.append(ChecklistItem("Missing Sex", "Present", "Missing" if miss_sex else "Present", not miss_sex))
-    checklist.append(ChecklistItem("Missing Age", "Present", "Missing" if miss_age else "Present", not miss_age))
-    checklist.append(ChecklistItem("Missing DQTR (if provided)", "Present/NA", "Missing" if miss_qtr else "Present/NA", not miss_qtr))
-    checklist.append(ChecklistItem("Missing Year (if provided)", "Present/NA", "Missing" if miss_year else "Present/NA", not miss_year))
-    checklist.append(ChecklistItem("Missing Principal DX", "Present", "Missing" if miss_pdx else "Present", not miss_pdx))
-
-    if miss_sex: exclusions.append("Missing Sex")
-    if miss_age: exclusions.append("Missing Age")
-    if miss_qtr: exclusions.append("Missing DQTR")
-    if miss_year: exclusions.append("Missing Year")
-    if miss_pdx: exclusions.append("Missing Pdx")
-
-    if not denominator_met:
-        return PSIEvalResult(
-            encounter_id=enc_id, psi="PSI_19",
-            result="EXCLUSION", denominator_met=False, numerator_met=False,
-            exclusions_applied=exclusions, rationale_short="Denominator not met",
-            checklist=checklist, debug={}
-        )
-    if exclusions:
-        return PSIEvalResult(
-            encounter_id=enc_id, psi="PSI_19",
-            result="EXCLUSION", denominator_met=True, numerator_met=False,
-            exclusions_applied=exclusions, rationale_short="Denominator exclusion(s) applied",
-            checklist=checklist, debug={}
-        )
-
-    # Numerator
-    numerator_hit = any(c in OBTRAID for c in all_dx)
-    checklist.append(ChecklistItem("Numerator: obstetric injury DX (OBTRAID)", "Yes", "Yes" if numerator_hit else "No", numerator_hit))
-
-    result = "INCLUSION" if numerator_hit else "EXCLUSION"
-    rationale = "Obstetric trauma (3rd/4th degree) present" if numerator_hit else "No qualifying obstetric trauma DX"
-
-    return PSIEvalResult(
-        encounter_id=enc_id, psi="PSI_19",
-        result=result, denominator_met=True, numerator_met=numerator_hit,
-        exclusions_applied=[], rationale_short=rationale,
-        checklist=checklist, debug={}
-    )
-
-@register_psi(19)
-def evaluate_psi19(row: pd.Series, codes: Dict[str, List[str]]) -> PSIEvalResult:
-    """
-    PSI-19 Obstetric Trauma Rate – Vaginal Delivery Without Instrument (2025).
-    Denominator: any-listed DELOCMD diagnosis AND any VAGDELP procedure.
-    Exclusions:
       - Any INSTRIP procedure (instrument-assisted delivery)
       - Principal DX in MDC15PRINDX (newborn)
       - DRG=999
@@ -3476,129 +3199,6 @@ def evaluate_psi19(row: pd.Series, codes: Dict[str, List[str]]) -> PSIEvalResult
         checklist=checklist, debug={}
     )
 
-# Stubs for others; will be replaced as rules are provided.
-for n in [4,5,6,7,8,9,10,11,12,13,14,15,17,18,19]:
-    def _stub(row: pd.Series, codes: Dict[str, List[str]], _n=n):
-        enc_id = str(row.get("EncounterID", ""))
-        return PSIEvalResult(
-            encounter_id=enc_id,
-            psi=f"PSI_{_n:02d}",
-            result="EXCLUSION",
-            denominator_met=False,
-            numerator_met=False,
-            exclusions_applied=[],
-            rationale_short="Awaiting rule text",
-            checklist=[],
-            debug={"status": "stub"},
-        )
-    _PSI_REGISTRY[n] = _stub
-
-
-@register_psi(5)
-def evaluate_psi05(row: pd.Series, codes: Dict[str, List[str]]) -> PSIEvalResult:
-    """
-    PSI-05 Retained Surgical Item or Unretrieved Device Fragment Count (2025).
-    """
-    enc_id = str(row.get("EncounterID", ""))
-    checklist: List[ChecklistItem] = []
-    exclusions: List[str] = []
-
-    # Core fields
-    age = row.get("Age", None)
-    drg3 = row.get("MS-DRG_3digit", "")
-    principal_dx = str(row.get("Pdx", "")).strip().upper()
-
-    # DRG sets
-    SURGI2R = set(str(x).zfill(3) for x in codes.get("SURGI2R", []))
-    MEDIC2R = set(str(x).zfill(3) for x in codes.get("MEDIC2R", []))
-
-    # Other sets
-    MDC14PRINDX = set(codes.get("MDC14PRINDX", []))
-    MDC15PRINDX = set(codes.get("MDC15PRINDX", []))
-    FOREIID = set(codes.get("FOREIID", []))
-
-    # Extract dx+poa
-    dx_list = extract_dx_poa(row)  # [(code, poa, role)]
-
-    # --- Denominator check
-    drg_ok = drg3 in SURGI2R or drg3 in MEDIC2R
-    age_ok = False
-    if age is not None and str(age).strip() != "":
-        try:
-            av = float(age)
-            age_ok = av >= 18
-        except Exception:
-            age_ok = False
-    obstetric_principal = principal_dx in MDC14PRINDX
-
-    checklist.append(ChecklistItem("DRG in SURGI2R or MEDIC2R", "Yes", drg3, drg_ok))
-    checklist.append(ChecklistItem("Age >=18 or obstetric principal", "Yes", f"Age={age}, obstetric={obstetric_principal}", age_ok or obstetric_principal))
-
-    denominator_met = drg_ok and (age_ok or obstetric_principal)
-
-    # --- Exclusions
-    # Principal in FOREIID
-    excl_pdx_forei = principal_dx in FOREIID
-    checklist.append(ChecklistItem("Principal not in FOREIID", "No", "Yes" if excl_pdx_forei else "No", not excl_pdx_forei))
-    if excl_pdx_forei: exclusions.append("PrincipalDX FOREIID")
-
-    # Secondary FOREIID with POA=Y
-    excl_sec_poaY = any(code in FOREIID and poa == "Y" for (code, poa, role) in dx_list if role == "SECONDARY")
-    checklist.append(ChecklistItem("No secondary FOREIID with POA=Y", "No", "Yes" if excl_sec_poaY else "No", not excl_sec_poaY))
-    if excl_sec_poaY: exclusions.append("Secondary FOREIID POA=Y")
-
-    # MDC15
-    excl_mdc15 = principal_dx in MDC15PRINDX
-    checklist.append(ChecklistItem("Principal not MDC15 (newborn)", "No", "Yes" if excl_mdc15 else "No", not excl_mdc15))
-    if excl_mdc15: exclusions.append("MDC15PRINDX")
-
-    # DRG=999
-    excl_drg999 = (drg3 == "999")
-    checklist.append(ChecklistItem("DRG not 999", "Not 999", drg3, not excl_drg999))
-    if excl_drg999: exclusions.append("DRG=999")
-
-    # Missing required fields
-    def missing(col: str) -> bool:
-        return (col not in row) or (pd.isna(row[col])) or (str(row[col]).strip() == "")
-    miss_sex = missing("Sex")
-    miss_age = missing("Age")
-    miss_qtr = missing("DQTR") if "DQTR" in row else False
-    miss_year = missing("Year") if "Year" in row else False
-    miss_pdx = missing("Pdx")
-
-    checklist.append(ChecklistItem("Missing Sex", "Present", "Missing" if miss_sex else "Present", not miss_sex))
-    checklist.append(ChecklistItem("Missing Age", "Present", "Missing" if miss_age else "Present", not miss_age))
-    checklist.append(ChecklistItem("Missing DQTR (if provided)", "Present/NA", "Missing" if miss_qtr else "Present/NA", not miss_qtr))
-    checklist.append(ChecklistItem("Missing Year (if provided)", "Present/NA", "Missing" if miss_year else "Present/NA", not miss_year))
-    checklist.append(ChecklistItem("Missing Principal DX", "Present", "Missing" if miss_pdx else "Present", not miss_pdx))
-
-    if miss_sex: exclusions.append("Missing Sex")
-    if miss_age: exclusions.append("Missing Age")
-    if miss_qtr: exclusions.append("Missing DQTR")
-    if miss_year: exclusions.append("Missing Year")
-    if miss_pdx: exclusions.append("Missing Pdx")
-
-    if "MDC" in row:
-        miss_mdc = missing("MDC")
-        checklist.append(ChecklistItem("Missing MDC (if provided)", "Present/NA", "Missing" if miss_mdc else "Present/NA", not miss_mdc))
-        if miss_mdc: exclusions.append("Missing MDC")
-
-    # --- Early exits
-    if not denominator_met:
-        return PSIEvalResult(enc_id, "PSI_05", "EXCLUSION", False, False, exclusions,
-            "Denominator not met", checklist, debug={"age": age, "drg3": drg3, "pdx": principal_dx})
-    if exclusions:
-        return PSIEvalResult(enc_id, "PSI_05", "EXCLUSION", True, False, exclusions,
-            "Exclusion(s) applied", checklist, debug={"exclusions": exclusions})
-
-    # --- Numerator: secondary FOREIID not POA=Y
-    numerator_hit = any(code in FOREIID and poa != "Y" for (code, poa, role) in dx_list if role == "SECONDARY")
-    checklist.append(ChecklistItem("Secondary FOREIID not POA=Y (numerator)", "Yes", "Yes" if numerator_hit else "No", numerator_hit))
-
-    result = "INCLUSION" if numerator_hit else "EXCLUSION"
-    rationale = "Triggered retained surgical item/device fragment" if numerator_hit else "No qualifying secondary FOREIID"
-
-    return PSIEvalResult(enc_id, "PSI_05", result, True, numerator_hit, [], rationale, checklist, debug={"numerator_hit": numerator_hit})
 
 # -------------------------
 # Orchestrator
@@ -3612,6 +3212,11 @@ def evaluate_dataframe(df: pd.DataFrame, codes: Dict[str, List[str]], debug_dir:
         enc_id = str(row.get("EncounterID", ""))
         for psi_n in PSI_LIST:
             fn = _PSI_REGISTRY.get(psi_n)
+            # Handle cases where a PSI function might not exist
+            if not fn:
+                print(f"Warning: No evaluation function found for PSI_{psi_n:02d}. Skipping.")
+                continue
+                
             res: PSIEvalResult = fn(row, codes)
 
             # Save debug file
