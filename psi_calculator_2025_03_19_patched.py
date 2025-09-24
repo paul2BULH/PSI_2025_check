@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 import pandas as pd
 import numpy as np
 
-PSI_LIST = [3,4,5,6,7,8,9,10,11,12,13,14,15,17,18,19]  # PSI 16 retired
+PSI_LIST = [3,4,5,6,7,8,9,10,11,12,13,14,15,17,18,19] # PSI 16 retired
 
 # -------------------------
 # Utilities
@@ -279,20 +279,51 @@ def build_pressure_ulcer_sets(codes: Dict[str, List[str]]):
     }
 
 def same_site_match(pi_site_key: str, dti_site_key: str) -> bool:
-    """Heuristic: strip prefixes and suffixes and compare mid tokens for site equality."""
+    """Match pressure ulcer site keys by comparing anatomical site components."""
     def site_core(k: str) -> str:
         k = k.upper()
+        # Remove PI or DTI prefix
         if k.startswith("PI"):
             k = k[2:]
-        if k.startswith("DTI"):
+        elif k.startswith("DTI"):
             k = k[3:]
-        # remove trailing D or EXD
+        # Remove trailing D or EXD
         if k.endswith("EXD"):
             k = k[:-3]
         elif k.endswith("D"):
             k = k[:-1]
         return k
-    return site_core(pi_site_key) == site_core(dti_site_key)
+    
+    pi_core = site_core(pi_site_key)
+    dti_core = site_core(dti_site_key)
+    
+    # Direct match
+    if pi_core == dti_core:
+        return True
+    
+    # Handle specific site mappings based on PSI 03 specification
+    # Left/Right variations should match the same anatomical site
+    site_mappings = {
+        'ELBOW': ['ELBOW', 'RELBOW', 'RELBO'],  # Handle elbow variations
+        'UPBACK': ['UPBACK', 'BACK'],
+        'LOBACK': ['LOBACK', 'BACK'], 
+        'SACRAL': ['SACRAL'],
+        'HIP': ['HIP'],
+        'BUTT': ['BUTT'],
+        'CONTBBH': ['CONTBBH', 'CONTIGBBH'],  # Handle contiguous body parts variations
+        'ANKLE': ['ANKLE'],
+        'HEEL': ['HEEL'],
+        'HEAD': ['HEAD'],
+        'OTHER': ['OTHER'],
+        'UNSPEC': ['UNSPEC', 'UNSPECD']
+    }
+    
+    # Check if both sites map to the same anatomical region
+    for region, variants in site_mappings.items():
+        if pi_core in variants and dti_core in variants:
+            return True
+    
+    return False
 
 # -------------------------
 # PSI Implementations
@@ -475,8 +506,8 @@ def evaluate_psi03(row: pd.Series, codes: Dict[str, List[str]]) -> PSIEvalResult
     for code, poa in secondary_dx:
         if code in pi_d_union and poa != "Y":
             pi_site = code_to_site_pi_d.get(code, "")
-            # Unspecified-site keys auto-qualify
-            if any(pi_site.startswith(u) for u in list({"PIN", "PIUNSPECD"})):
+            # Unspecified-site keys auto-qualify (per PSI 03 specification)
+            if pi_site in unspecified_keys:
                 numerator_hit = True
                 details.append(("PI~D unspecified site", code, poa, pi_site, None))
                 break
@@ -2030,8 +2061,8 @@ def evaluate_psi11(row: pd.Series, codes: Dict[str, List[str]]) -> PSIEvalResult
     checklist.append(ChecklistItem("Numerator path 3: PR9671P last >= 2 days after first OR", "Yes (any path)", f"{last_9671_dt} vs OR {earliest_or_dt}", numerator_met if path3 else False))
     checklist.append(ChecklistItem("Numerator path 4: PR9604P last >= 1 day after first OR", "Yes (any path)", f"{last_9604_dt} vs OR {earliest_or_dt}", numerator_met if path4 else False))
 
-    result = "INCLUSION" if numerator_hit else "EXCLUSION"
-    rationale = "Postop respiratory failure criteria met" if numerator_hit else "No qualifying postoperative respiratory failure"
+    result = "INCLUSION" if numerator_met else "EXCLUSION"
+    rationale = "Postop respiratory failure criteria met" if numerator_met else "No qualifying postoperative respiratory failure"
 
     debug.update({
         "earliest_or": str(earliest_or_dt),
@@ -2043,7 +2074,7 @@ def evaluate_psi11(row: pd.Series, codes: Dict[str, List[str]]) -> PSIEvalResult
 
     return PSIEvalResult(
         encounter_id=enc_id, psi="PSI_11",
-        result=result, denominator_met=True, numerator_met=numerator_hit,
+        result=result, denominator_met=True, numerator_met=numerator_met,
         exclusions_applied=[], rationale_short=rationale,
         checklist=checklist, debug=debug
     )
@@ -3234,6 +3265,12 @@ def evaluate_dataframe(df: pd.DataFrame, codes: Dict[str, List[str]], debug_dir:
 
 
 def main():
+    # ap = argparse.ArgumentParser(description="PSI 03–19 Calculator (2025)")
+    # ap.add_argument("--excel", required=True, help="Path to input Excel with patient data")
+    # ap.add_argument("--sheet", default=0, help="Excel sheet name or index (default: first sheet)")
+    # ap.add_argument("--codes", default="PSI_Code_Sets_2025.json", help="Path to PSI code sets JSON (2025)")
+    # ap.add_argument("--out", default="psi_results.csv", help="Output CSV path")
+    # ap.add_argument("--debug_dir", default="psi_debug", help="Directory to save per-PSI debug JSON files")
     ap = argparse.ArgumentParser(description="PSI 03–19 Calculator (2025)")
     ap.add_argument("--excel", required=True, help="Path to input Excel with patient data")
     ap.add_argument("--sheet", default=0, help="Excel sheet name or index (default: first sheet)")
